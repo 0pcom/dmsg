@@ -93,7 +93,7 @@ var rootCmd = &cobra.Command{
 			}
 		}()
 
-		log.WithField("dmsg_addr", c.LocalAddr().String()).
+		log.WithField("dmsg_addr", pk.String()).
 			Info("SOCKS5 Proxy Server started.")
 
 		// Create a SOCKS5 proxy server using the dmsg client
