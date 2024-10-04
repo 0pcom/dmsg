@@ -27,10 +27,19 @@ The connection between a `dmsg.Client` and `dmsg.Server` is called a `dmsg.Sessi
 
 ## Dmsg tools and libraries
 
-- [`dmsgget`](./docs/dmsgget.md) - Simplified `wget` over `dmsg`.
+- [`dmsgcurl`](./docs/dmsgcurl.md) - Simplified `curl` over `dmsg`.
 - [`dmsgpty`](./docs/dmsgpty.md) - Simplified `SSH` over `dmsg`.
 ## Additional resources
 - [`dmsg` examples.](./examples)
 - [`dmsg.Discovery` documentation.](./cmd/dmsg-discovery/README.md)
 - [Starting a local `dmsg` environment.](./integration/README.md)
 
+## Dependency Graph
+
+made with [goda](https://github.com/loov/goda)
+
+```
+goda graph github.com/skycoin/dmsg/... | dot -Tsvg -o docs/dmsg-goda-graph.svg
+```
+
+![Dependency Graph](docs/dmsg-goda-graph.svg "github.com/skycoin/dmsg Dependency Graph")

@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -34,7 +35,7 @@ var json = jsoniter.ConfigFastest
 // variables
 var (
 	// persistent flags
-	dmsgDisc     = dmsg.DefaultDiscAddr
+	dmsgDisc     = dmsg.DiscAddr(false)
 	dmsgSessions = dmsg.DefaultMinSessions
 	dmsgPort     = dmsgpty.DefaultPort
 	cliNet       = dmsgpty.DefaultCLINet
@@ -55,35 +56,110 @@ var (
 func init() {
 
 	// Prepare flags with env/config references.
-
-	RootCmd.PersistentFlags().Var(&wl, "wl",
-		"whitelist of the dmsgpty-host")
-
-	RootCmd.PersistentFlags().StringVar(&dmsgDisc, "dmsgdisc", dmsgDisc,
-		"dmsg discovery address")
-
-	RootCmd.PersistentFlags().IntVar(&dmsgSessions, "dmsgsessions", dmsgSessions,
-		"minimum number of dmsg sessions to ensure")
-
-	RootCmd.PersistentFlags().Uint16Var(&dmsgPort, "dmsgport", dmsgPort,
-		"dmsg port for listening for remote hosts")
-
-	RootCmd.PersistentFlags().StringVar(&cliNet, "clinet", cliNet,
-		"network used for listening for cli connections")
-
-	RootCmd.PersistentFlags().StringVar(&cliAddr, "cliaddr", cliAddr,
-		"address used for listening for cli connections")
-
+	RootCmd.Flags().Var(&wl, "wl", "whitelist of the dmsgpty-host")
+	RootCmd.Flags().StringVar(&dmsgDisc, "dmsgdisc", dmsgDisc, "dmsg discovery address")
+	RootCmd.Flags().IntVar(&dmsgSessions, "dmsgsessions", dmsgSessions, "minimum number of dmsg sessions to ensure")
+	RootCmd.Flags().Uint16Var(&dmsgPort, "dmsgport", dmsgPort, "dmsg port for listening for remote hosts")
+	RootCmd.Flags().StringVar(&cliNet, "clinet", cliNet, "network used for listening for cli connections")
+	RootCmd.Flags().StringVar(&cliAddr, "cliaddr", cliAddr, "address used for listening for cli connections")
 	// Prepare flags without associated env/config references.
+	RootCmd.Flags().StringVar(&envPrefix, "envprefix", envPrefix, "env prefix")
+	RootCmd.Flags().BoolVar(&confStdin, "confstdin", confStdin, "config will be read from stdin if set")
+	RootCmd.Flags().StringVarP(&confPath, "confpath", "c", confPath, "config path")
 
-	RootCmd.PersistentFlags().StringVar(&envPrefix, "envprefix", envPrefix,
-		"env prefix")
+}
 
-	RootCmd.Flags().BoolVar(&confStdin, "confstdin", confStdin,
-		"config will be read from stdin if set")
+// RootCmd contains commands for dmsgpty-host
+var RootCmd = &cobra.Command{
+	Use: func() string {
+		return strings.Split(filepath.Base(strings.ReplaceAll(strings.ReplaceAll(fmt.Sprintf("%v", os.Args), "[", ""), "]", "")), " ")[0]
+	}(),
+	Short: "DMSG host for pseudoterminal command line interface",
+	Long: `
+	┌┬┐┌┬┐┌─┐┌─┐┌─┐┌┬┐┬ ┬   ┬ ┬┌─┐┌─┐┌┬┐
+	 │││││└─┐│ ┬├─┘ │ └┬┘───├─┤│ │└─┐ │
+	─┴┘┴ ┴└─┘└─┘┴   ┴  ┴    ┴ ┴└─┘└─┘ ┴
+DMSG host for pseudoterminal command line interface`,
+	SilenceErrors:         true,
+	SilenceUsage:          true,
+	DisableSuggestions:    true,
+	DisableFlagsInUseLine: true,
+	PreRun:                func(cmd *cobra.Command, args []string) {},
+	RunE: func(cmd *cobra.Command, args []string) error {
+		conf, err := getConfig(cmd, false)
+		if err != nil {
+			return fmt.Errorf("failed to get config: %w", err)
+		}
 
-	RootCmd.Flags().StringVarP(&confPath, "confpath", "c", confPath,
-		"config path")
+		if _, err := buildinfo.Get().WriteTo(stdlog.Writer()); err != nil {
+			log.Printf("Failed to output build info: %v", err)
+		}
+		log := logging.MustGetLogger("dmsgpty-host")
+		ctx, cancel := cmdutil.SignalContext(context.Background(), log)
+		defer cancel()
+
+		pk, err := sk.PubKey()
+		if err != nil {
+			return fmt.Errorf("failed to derive public key from secret key: %w", err)
+		}
+
+		// Prepare and serve dmsg client and wait until ready.
+		dmsgC := dmsg.NewClient(pk, sk, disc.NewHTTP(conf.DmsgDisc, &http.Client{}, log), &dmsg.Config{
+			MinSessions: conf.DmsgSessions,
+		})
+		go dmsgC.Serve(context.Background())
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("failed to wait dmsg client to be ready: %w", ctx.Err())
+		case <-dmsgC.Ready():
+		}
+
+		// Prepare whitelist.
+		// var wl dmsgpty.Whitelist
+		wl, err := dmsgpty.NewConfigWhitelist(confPath)
+		if err != nil {
+			return fmt.Errorf("failed to init whitelist: %w", err)
+		}
+
+		// Prepare dmsgpty host.
+		host := dmsgpty.NewHost(dmsgC, wl)
+		wg := new(sync.WaitGroup)
+		wg.Add(2)
+
+		// Prepare CLI.
+		if conf.CLINet == "unix" {
+			_ = os.Remove(conf.CLIAddr) //nolint:errcheck
+		}
+		cliL, err := net.Listen(conf.CLINet, conf.CLIAddr)
+		if err != nil {
+			return fmt.Errorf("failed to serve CLI: %w", err)
+		}
+		log.WithField("addr", cliL.Addr()).Info("Listening for CLI connections.")
+		go func() {
+			log.WithError(host.ServeCLI(ctx, cliL)).
+				Info("Stopped serving CLI.")
+			wg.Done()
+		}()
+
+		// Serve dmsgpty.
+		log.WithField("port", conf.DmsgPort).
+			Info("Listening for dmsg streams.")
+		go func() {
+			log.WithError(host.ListenAndServe(ctx, conf.DmsgPort)).
+				Info("Stopped serving dmsgpty-host.")
+			wg.Done()
+		}()
+
+		wg.Wait()
+		return nil
+	},
+}
+
+// Execute executes the root command.
+func Execute() {
+	if err := RootCmd.Execute(); err != nil {
+		os.Exit(1)
+	}
 }
 
 func configFromJSON(conf dmsgpty.Config) (dmsgpty.Config, error) {
@@ -199,7 +275,7 @@ func fillConfigFromENV(conf dmsgpty.Config) (dmsgpty.Config, error) {
 }
 
 func fillConfigFromFlags(conf dmsgpty.Config) dmsgpty.Config {
-	if dmsgDisc != dmsg.DefaultDiscAddr {
+	if dmsgDisc != dmsg.DiscAddr(false) {
 		conf.DmsgDisc = dmsgDisc
 	}
 
@@ -265,86 +341,4 @@ func getConfig(cmd *cobra.Command, skGen bool) (dmsgpty.Config, error) {
 	pLog.Info("Init complete.")
 
 	return conf, nil
-}
-
-// RootCmd contains commands for dmsgpty-host
-var RootCmd = &cobra.Command{
-	Use:    cmdutil.RootCmdName(),
-	Short:  "runs a standalone dmsgpty-host instance",
-	PreRun: func(cmd *cobra.Command, args []string) {},
-	RunE: func(cmd *cobra.Command, args []string) error {
-		conf, err := getConfig(cmd, false)
-		if err != nil {
-			return fmt.Errorf("failed to get config: %w", err)
-		}
-
-		if _, err := buildinfo.Get().WriteTo(stdlog.Writer()); err != nil {
-			log.Printf("Failed to output build info: %v", err)
-		}
-		log := logging.MustGetLogger("dmsgpty-host")
-		ctx, cancel := cmdutil.SignalContext(context.Background(), log)
-		defer cancel()
-
-		pk, err := sk.PubKey()
-		if err != nil {
-			return fmt.Errorf("failed to derive public key from secret key: %w", err)
-		}
-
-		// Prepare and serve dmsg client and wait until ready.
-		dmsgC := dmsg.NewClient(pk, sk, disc.NewHTTP(conf.DmsgDisc, &http.Client{}, log), &dmsg.Config{
-			MinSessions: conf.DmsgSessions,
-		})
-		go dmsgC.Serve(context.Background())
-		select {
-		case <-ctx.Done():
-			return fmt.Errorf("failed to wait dmsg client to be ready: %w", ctx.Err())
-		case <-dmsgC.Ready():
-		}
-
-		// Prepare whitelist.
-		// var wl dmsgpty.Whitelist
-		wl, err := dmsgpty.NewConfigWhitelist(confPath)
-		if err != nil {
-			return fmt.Errorf("failed to init whitelist: %w", err)
-		}
-
-		// Prepare dmsgpty host.
-		host := dmsgpty.NewHost(dmsgC, wl)
-		wg := new(sync.WaitGroup)
-		wg.Add(2)
-
-		// Prepare CLI.
-		if conf.CLINet == "unix" {
-			_ = os.Remove(conf.CLIAddr) //nolint:errcheck
-		}
-		cliL, err := net.Listen(conf.CLINet, conf.CLIAddr)
-		if err != nil {
-			return fmt.Errorf("failed to serve CLI: %w", err)
-		}
-		log.WithField("addr", cliL.Addr()).Info("Listening for CLI connections.")
-		go func() {
-			log.WithError(host.ServeCLI(ctx, cliL)).
-				Info("Stopped serving CLI.")
-			wg.Done()
-		}()
-
-		// Serve dmsgpty.
-		log.WithField("port", conf.DmsgPort).
-			Info("Listening for dmsg streams.")
-		go func() {
-			log.WithError(host.ListenAndServe(ctx, conf.DmsgPort)).
-				Info("Stopped serving dmsgpty-host.")
-			wg.Done()
-		}()
-
-		wg.Wait()
-		return nil
-	},
-}
-
-// Execute executes the root command.
-func Execute() {
-	if err := RootCmd.Execute(); err != nil {
-		os.Exit(1)
-	}
 }

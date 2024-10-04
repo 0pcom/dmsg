@@ -40,8 +40,8 @@ builds:
     main: ./cmd/dmsg-server/
     ldflags: -s -w -X github.com/skycoin/skywire-utilities/pkg/buildinfo.version=v{{.Version}} -X github.com/skycoin/skywire-utilities/pkg/buildinfo.commit={{.ShortCommit}} -X github.com/skycoin/skywire-utilities/pkg/buildinfo.date={{.Date}}
 
-  - id: dmsgget
-    binary: dmsgget
+  - id: dmsgcurl
+    binary: dmsgcurl
     goos:
       - darwin
     goarch:
@@ -49,7 +49,7 @@ builds:
       - amd64
     env:
       - CGO_ENABLED=0
-    main: ./cmd/dmsgget/
+    main: ./cmd/dmsgcurl/
     ldflags: -s -w -X github.com/skycoin/skywire-utilities/pkg/buildinfo.version=v{{.Version}} -X github.com/skycoin/skywire-utilities/pkg/buildinfo.commit={{.ShortCommit}} -X github.com/skycoin/skywire-utilities/pkg/buildinfo.date={{.Date}}
 
   - id: dmsgpty-ui
@@ -88,6 +88,42 @@ builds:
     main: ./cmd/dmsgpty-cli/
     ldflags: -s -w -X github.com/skycoin/skywire-utilities/pkg/buildinfo.version=v{{.Version}} -X github.com/skycoin/skywire-utilities/pkg/buildinfo.commit={{.ShortCommit}} -X github.com/skycoin/skywire-utilities/pkg/buildinfo.date={{.Date}}
 
+  - id: dmsgweb
+    binary: dmsgweb
+    goos:
+      - darwin
+    goarch:
+      - arm64
+      - amd64
+    env:
+      - CGO_ENABLED=0
+    main: ./cmd/dmsgweb/
+    ldflags: -s -w -X github.com/skycoin/skywire-utilities/pkg/buildinfo.version=v{{.Version}} -X github.com/skycoin/skywire-utilities/pkg/buildinfo.commit={{.ShortCommit}} -X github.com/skycoin/skywire-utilities/pkg/buildinfo.date={{.Date}}
+
+  - id: dmsghttp
+    binary: dmsghttp
+    goos:
+      - darwin
+    goarch:
+      - arm64
+      - amd64
+    env:
+      - CGO_ENABLED=0
+    main: ./cmd/dmsghttp/
+    ldflags: -s -w -X github.com/skycoin/skywire-utilities/pkg/buildinfo.version=v{{.Version}} -X github.com/skycoin/skywire-utilities/pkg/buildinfo.commit={{.ShortCommit}} -X github.com/skycoin/skywire-utilities/pkg/buildinfo.date={{.Date}}
+
+  - id: dmsg-socks5
+    binary: dmsg-socks5
+    goos:
+      - darwin
+    goarch:
+      - arm64
+      - amd64
+    env:
+      - CGO_ENABLED=0
+    main: ./cmd/dmsg-socks5/
+    ldflags: -s -w -X github.com/skycoin/skywire-utilities/pkg/buildinfo.version=v{{.Version}} -X github.com/skycoin/skywire-utilities/pkg/buildinfo.commit={{.ShortCommit}} -X github.com/skycoin/skywire-utilities/pkg/buildinfo.date={{.Date}}
+
 archives:
   - id: archive
     format: tar.gz
@@ -98,8 +134,11 @@ archives:
       - dmsg-server
       - dmsgpty-ui
       - dmsgpty-host
-      - dmsgget
+      - dmsgcurl
       - dmsgpty-cli
+      - dmsgweb
+      - dmsghttp
+      - dmsg-socks5
     allow_different_binary_count: true
 
 checksum:

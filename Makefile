@@ -87,7 +87,7 @@ install-linters-windows: ## Install linters on windows
 	${OPTS} go install github.com/incu6us/goimports-reviser@latest
 
 format: ## Formats the code. Must have goimports and goimports-reviser installed (use make install-linters).
-	${OPTS} goimports -local ${DMSG_REPO} -w .
+	${OPTS} goimports -w -local ${DMSG_REPO} ./pkg ./cmd ./internal ./examples
 	find . -type f -name '*.go' -not -path "./.git/*" -not -path "./vendor/*"  -exec goimports-reviser -project-name ${DMSG_REPO} {} \;
 
 
@@ -98,7 +98,7 @@ dep: ## Sorts dependencies
 	${OPTS} go mod vendor -v
 	${OPTS} go mod tidy -v
 
-install: ## Install `dmsg-discovery`, `dmsg-server`, `dmsgget`,`dmsgpty-cli`, `dmsgpty-host`, `dmsgpty-ui`
+install: ## Install `dmsg-discovery`, `dmsg-server`, `dmsgcurl`,`dmsgpty-cli`, `dmsgpty-host`, `dmsgpty-ui`
 	${OPTS} go install ${BUILD_OPTS} ./cmd/*
 
 build: ## Build binaries into ./bin
@@ -120,10 +120,10 @@ github-prepare-release:
 	sed '/^## ${GITHUB_TAG}$$/,/^## .*/!d;//d;/^$$/d' ./CHANGELOG.md > releaseChangelog.md
 
 github-release: github-prepare-release
-	goreleaser --rm-dist --config .goreleaser-linux.yml --release-notes releaseChangelog.md
+	goreleaser --clean --config .goreleaser-linux.yml --release-notes releaseChangelog.md
 
 github-release-darwin:
-	goreleaser --rm-dist  --config .goreleaser-darwin.yml --skip-publish
+	goreleaser --clean  --config .goreleaser-darwin.yml  --skip=publish
 	$(eval GITHUB_TAG=$(shell git describe --abbrev=0 --tags))
 	gh release upload --repo skycoin/dmsg ${GITHUB_TAG} ./dist/dmsg-${GITHUB_TAG}-darwin-amd64.tar.gz
 	gh release upload --repo skycoin/dmsg ${GITHUB_TAG} ./dist/dmsg-${GITHUB_TAG}-darwin-arm64.tar.gz
@@ -132,7 +132,7 @@ github-release-darwin:
 	gh release upload --repo skycoin/dmsg ${GITHUB_TAG} --clobber ./checksums.txt
 
 github-release-windows:
-	.\goreleaser\goreleaser.exe --rm-dist  --config .goreleaser-windows.yml --skip-publish
+	.\goreleaser\goreleaser.exe --clean  --config .goreleaser-windows.yml --skip=publish
 	$(eval GITHUB_TAG=$(shell powershell git describe --abbrev=0 --tags))
 	gh release upload --repo skycoin/dmsg ${GITHUB_TAG} ./dist/dmsg-${GITHUB_TAG}-windows-amd64.zip
 	gh release upload --repo skycoin/dmsg ${GITHUB_TAG} ./dist/dmsg-${GITHUB_TAG}-windows-386.zip

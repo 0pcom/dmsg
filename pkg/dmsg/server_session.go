@@ -2,12 +2,13 @@
 package dmsg
 
 import (
+	"fmt"
 	"io"
 	"net"
 
+	"github.com/hashicorp/yamux"
 	"github.com/sirupsen/logrus"
 	"github.com/skycoin/skywire-utilities/pkg/netutil"
-	"github.com/skycoin/yamux"
 
 	"github.com/skycoin/dmsg/internal/servermetrics"
 	"github.com/skycoin/dmsg/pkg/noise"
@@ -98,6 +99,29 @@ func (ss *ServerSession) serveStream(log logrus.FieldLogger, yStr *yamux.Stream)
 		WithField("dst_addr", req.DstAddr)
 
 	log.Debug("Read stream request from initiating side.")
+	if req.IPinfo && req.DstAddr.PK == ss.entity.LocalPK() {
+		log.Debug("Received IP stream request.")
+
+		ip, err := addrToIP(yStr.RemoteAddr())
+		if err != nil {
+			ss.m.RecordStream(servermetrics.DeltaFailed) // record failed stream
+			return err
+		}
+
+		resp := StreamResponse{
+			ReqHash:  req.raw.Hash(),
+			Accepted: true,
+			IP:       ip,
+		}
+		obj := MakeSignedStreamResponse(&resp, ss.entity.LocalSK())
+
+		if err := ss.writeObject(yStr, obj); err != nil {
+			ss.m.RecordStream(servermetrics.DeltaFailed) // record failed stream
+			return err
+		}
+		log.Debug("Wrote IP stream response.")
+		return nil
+	}
 
 	// Obtain next session.
 	ss2, ok := ss.entity.serverSession(req.DstAddr.PK)
@@ -127,6 +151,17 @@ func (ss *ServerSession) serveStream(log logrus.FieldLogger, yStr *yamux.Stream)
 	ss.m.RecordStream(servermetrics.DeltaConnect)          // record successful stream
 	defer ss.m.RecordStream(servermetrics.DeltaDisconnect) // record disconnection
 	return netutil.CopyReadWriteCloser(yStr, yStr2)
+}
+
+func addrToIP(addr net.Addr) (net.IP, error) {
+	switch a := addr.(type) {
+	case *net.TCPAddr:
+		return a.IP, nil
+	case *net.UDPAddr:
+		return a.IP, nil
+	default:
+		return nil, fmt.Errorf("unsupported address type %T", addr)
+	}
 }
 
 func (ss *ServerSession) forwardRequest(req StreamRequest) (yStr *yamux.Stream, respObj SignedObject, err error) {

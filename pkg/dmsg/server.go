@@ -7,7 +7,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/sirupsen/logrus"
 	"github.com/skycoin/skywire-utilities/pkg/cipher"
 	"github.com/skycoin/skywire-utilities/pkg/logging"
 	"github.com/skycoin/skywire-utilities/pkg/netutil"
@@ -20,6 +19,7 @@ import (
 type ServerConfig struct {
 	MaxSessions    int
 	UpdateInterval time.Duration
+	AuthPassphrase string
 }
 
 // DefaultServerConfig returns the default server config.
@@ -49,6 +49,8 @@ type Server struct {
 	addrDone chan struct{}
 
 	maxSessions int
+
+	authPassphrase string
 }
 
 // NewServer creates a new dmsg server entity.
@@ -69,11 +71,12 @@ func NewServer(pk cipher.PubKey, sk cipher.SecKey, dc disc.APIClient, conf *Serv
 	s.addrDone = make(chan struct{})
 	s.maxSessions = conf.MaxSessions
 	s.setSessionCallback = func(ctx context.Context) error {
-		return s.updateServerEntry(ctx, s.AdvertisedAddr(), s.maxSessions)
+		return s.updateServerEntry(ctx, s.AdvertisedAddr(), s.maxSessions, conf.AuthPassphrase)
 	}
 	s.delSessionCallback = func(ctx context.Context) error {
-		return s.updateServerEntry(ctx, s.AdvertisedAddr(), s.maxSessions)
+		return s.updateServerEntry(ctx, s.AdvertisedAddr(), s.maxSessions, conf.AuthPassphrase)
 	}
+	s.authPassphrase = conf.AuthPassphrase
 	return s
 }
 
@@ -168,13 +171,13 @@ func (s *Server) Serve(lis net.Listener, addr string) error {
 
 func (s *Server) startUpdateEntryLoop(ctx context.Context) error {
 	err := netutil.NewDefaultRetrier(s.log).Do(ctx, func() error {
-		return s.updateServerEntry(ctx, s.AdvertisedAddr(), s.maxSessions)
+		return s.updateServerEntry(ctx, s.AdvertisedAddr(), s.maxSessions, s.authPassphrase)
 	})
 	if err != nil {
 		return err
 	}
 
-	go s.updateServerEntryLoop(ctx, s.AdvertisedAddr(), s.maxSessions)
+	go s.updateServerEntryLoop(ctx, s.AdvertisedAddr(), s.maxSessions, s.authPassphrase)
 	return nil
 }
 
@@ -202,12 +205,12 @@ func (s *Server) Ready() <-chan struct{} {
 }
 
 func (s *Server) handleSession(conn net.Conn) {
-	log := logrus.FieldLogger(s.log.WithField("remote_tcp", conn.RemoteAddr()))
+	log := s.log.WithField("remote_tcp", conn.RemoteAddr())
 
 	dSes, err := makeServerSession(s.m, &s.EntityCommon, conn)
 	if err != nil {
 		if err := conn.Close(); err != nil {
-			log.WithError(err).Debug("On handleSession() failure, close connection resulted in error.")
+			log.WithError(err).Warn("On handleSession() failure, close connection resulted in error.")
 		}
 		return
 	}

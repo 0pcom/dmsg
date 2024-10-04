@@ -22,6 +22,7 @@ import (
 	"github.com/skycoin/dmsg/internal/discmetrics"
 	"github.com/skycoin/dmsg/internal/dmsg-discovery/store"
 	"github.com/skycoin/dmsg/pkg/disc"
+	"github.com/skycoin/dmsg/pkg/dmsg"
 )
 
 var log = logging.MustGetLogger("dmsg-discovery")
@@ -42,10 +43,14 @@ type API struct {
 	testMode                    bool
 	startedAt                   time.Time
 	enableLoadTesting           bool
+	dmsgAddr                    string
+	DmsgServers                 []string
+	authPassphrase              string
+	OfficialServers             map[string]bool
 }
 
 // New returns a new API object, which can be started as a server
-func New(log logrus.FieldLogger, db store.Storer, m discmetrics.Metrics, testMode, enableLoadTesting, enableMetrics bool) *API {
+func New(log logrus.FieldLogger, db store.Storer, m discmetrics.Metrics, testMode, enableLoadTesting, enableMetrics bool, dmsgAddr, authPassphrase string) *API {
 	if log != nil {
 		log = logging.MustGetLogger("dmsg_disc")
 	}
@@ -63,6 +68,10 @@ func New(log logrus.FieldLogger, db store.Storer, m discmetrics.Metrics, testMod
 		startedAt:                   time.Now(),
 		enableLoadTesting:           enableLoadTesting,
 		reqsInFlightCountMiddleware: metricsutil.NewRequestsInFlightCountMiddleware(),
+		dmsgAddr:                    dmsgAddr,
+		DmsgServers:                 []string{},
+		authPassphrase:              authPassphrase,
+		OfficialServers:             make(map[string]bool),
 	}
 
 	r.Use(middleware.RequestID)
@@ -80,6 +89,7 @@ func New(log logrus.FieldLogger, db store.Storer, m discmetrics.Metrics, testMod
 	r.Post("/dmsg-discovery/entry/{pk}", api.setEntry())
 	r.Delete("/dmsg-discovery/entry", api.delEntry())
 	r.Get("/dmsg-discovery/entries", api.allEntries())
+	r.Get("/dmsg-discovery/visorEntries", api.allVisorEntries())
 	r.Delete("/dmsg-discovery/deregister", api.deregisterEntry())
 	r.Get("/dmsg-discovery/available_servers", api.getAvailableServers())
 	r.Get("/dmsg-discovery/all_servers", api.getAllServers())
@@ -108,7 +118,7 @@ func (a *API) RunBackgroundTasks(ctx context.Context, log logrus.FieldLogger) {
 }
 
 // AllServers is used to get all the available servers registered to the dmsg-discovery.
-func (a *API) AllServers(ctx context.Context, log logrus.FieldLogger) (entries []*disc.Entry, err error) {
+func (a *API) AllServers(ctx context.Context, _ logrus.FieldLogger) (entries []*disc.Entry, err error) {
 	entries, err = a.db.AllServers(ctx)
 	if err != nil {
 		return entries, err
@@ -146,6 +156,20 @@ func (a *API) getEntry() func(w http.ResponseWriter, r *http.Request) {
 func (a *API) allEntries() func(w http.ResponseWriter, r *http.Request) {
 	return func(w http.ResponseWriter, r *http.Request) {
 		entries, err := a.db.AllEntries(r.Context())
+		if err != nil {
+			a.handleError(w, r, err)
+			return
+		}
+		a.writeJSON(w, r, http.StatusOK, entries)
+	}
+}
+
+// allVisorEntries returns all visor client entries connected to dmsg
+// URI: /dmsg-discovery/visorEntries
+// Method: GET
+func (a *API) allVisorEntries() func(w http.ResponseWriter, r *http.Request) {
+	return func(w http.ResponseWriter, r *http.Request) {
+		entries, err := a.db.AllVisorEntries(r.Context())
 		if err != nil {
 			a.handleError(w, r, err)
 			return
@@ -247,7 +271,6 @@ func (a *API) setEntry() func(w http.ResponseWriter, r *http.Request) {
 		if timeout := r.URL.Query().Get("timeout"); timeout == "true" {
 			entryTimeout = store.DefaultTimeout
 		}
-
 		entry := new(disc.Entry)
 		if err := json.NewDecoder(r.Body).Decode(entry); err != nil {
 			a.handleError(w, r, disc.ErrUnexpected)
@@ -280,6 +303,14 @@ func (a *API) setEntry() func(w http.ResponseWriter, r *http.Request) {
 			if err := entry.VerifySignature(); err != nil {
 				a.handleError(w, r, disc.ErrUnauthorized)
 				return
+			}
+		}
+
+		if entry.Server != nil {
+			if entry.Server.ServerType == a.authPassphrase || a.OfficialServers[entry.Static.Hex()] {
+				entry.Server.ServerType = dmsg.DefaultOfficialDmsgServerType
+			} else {
+				entry.Server.ServerType = dmsg.DefaultCommunityDmsgServerType
 			}
 		}
 
@@ -413,8 +444,10 @@ func (a *API) getAllServers() http.HandlerFunc {
 func (a *API) serviceHealth(w http.ResponseWriter, r *http.Request) {
 	info := buildinfo.Get()
 	a.writeJSON(w, r, http.StatusOK, httputil.HealthCheckResponse{
-		BuildInfo: info,
-		StartedAt: a.startedAt,
+		BuildInfo:   info,
+		StartedAt:   a.startedAt,
+		DmsgAddr:    a.dmsgAddr,
+		DmsgServers: a.DmsgServers,
 	})
 }
 

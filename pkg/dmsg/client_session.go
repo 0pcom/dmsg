@@ -6,9 +6,9 @@ import (
 	"net"
 	"time"
 
+	"github.com/hashicorp/yamux"
 	"github.com/skycoin/skywire-utilities/pkg/cipher"
 	"github.com/skycoin/skywire-utilities/pkg/netutil"
-	"github.com/skycoin/yamux"
 )
 
 // ClientSession represents a session from the perspective of a dmsg client.
@@ -67,6 +67,50 @@ func (cs *ClientSession) DialStream(dst Addr) (dStr *Stream, err error) {
 	}
 
 	return dStr, err
+}
+
+// LookupIP attempts to dial a stream to the server for the IP address of the client.
+func (cs *ClientSession) LookupIP(dst Addr) (myIP net.IP, err error) {
+	log := cs.log.
+		WithField("func", "ClientSession.LookupIP").
+		WithField("dst_addr", cs.rPK)
+
+	dStr, err := newInitiatingStream(cs)
+	if err != nil {
+		return nil, err
+	}
+
+	// Close stream on failure.
+	defer func() {
+		if err != nil {
+			log.WithError(err).
+				WithField("close_error", dStr.Close()).
+				Debug("Stream closed on failure.")
+		}
+	}()
+
+	// Prepare deadline.
+	if err = dStr.SetDeadline(time.Now().Add(HandshakeTimeout)); err != nil {
+		return nil, err
+	}
+
+	// Do stream handshake.
+	req, err := dStr.writeIPRequest(dst)
+	if err != nil {
+		return nil, err
+	}
+
+	myIP, err = dStr.readIPResponse(req)
+	if err != nil {
+		return nil, err
+	}
+
+	err = dStr.Close()
+	if err != nil {
+		return nil, err
+	}
+
+	return myIP, err
 }
 
 // serve accepts incoming streams from remote clients.

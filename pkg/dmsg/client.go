@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math/rand"
 	"net"
 	"sync"
 	"time"
@@ -31,18 +32,20 @@ type ClientCallbacks struct {
 
 func (sc *ClientCallbacks) ensure() {
 	if sc.OnSessionDial == nil {
-		sc.OnSessionDial = func(network, addr string) (err error) { return nil }
+		sc.OnSessionDial = func(network, addr string) (err error) { return nil } //nolint
 	}
 	if sc.OnSessionDisconnect == nil {
-		sc.OnSessionDisconnect = func(network, addr string, err error) {}
+		sc.OnSessionDisconnect = func(network, addr string, err error) {} //nolint
 	}
 }
 
 // Config configures a dmsg client entity.
 type Config struct {
-	MinSessions    int
-	UpdateInterval time.Duration // Duration between discovery entry updates.
-	Callbacks      *ClientCallbacks
+	MinSessions          int
+	UpdateInterval       time.Duration // Duration between discovery entry updates.
+	Callbacks            *ClientCallbacks
+	ClientType           string
+	ConnectedServersType string
 }
 
 // Ensure ensures all config values are set.
@@ -57,7 +60,7 @@ func (c *Config) Ensure() {
 func DefaultConfig() *Config {
 	conf := &Config{
 		MinSessions:    DefaultMinSessions,
-		UpdateInterval: DefaultUpdateInterval,
+		UpdateInterval: DefaultUpdateInterval * 5,
 	}
 	return conf
 }
@@ -107,10 +110,9 @@ func NewClient(pk cipher.PubKey, sk cipher.SecKey, dc disc.APIClient, conf *Conf
 
 	// Init callback: on set session.
 	c.EntityCommon.setSessionCallback = func(ctx context.Context) error {
-		if err := c.EntityCommon.updateClientEntry(ctx, c.done); err != nil {
+		if err := c.EntityCommon.updateClientEntry(ctx, c.done, c.conf.ClientType); err != nil {
 			return err
 		}
-
 		// Client is 'ready' once we have successfully updated the discovery entry
 		// with at least one delegated server.
 		c.readyOnce.Do(func() { close(c.ready) })
@@ -119,7 +121,7 @@ func NewClient(pk cipher.PubKey, sk cipher.SecKey, dc disc.APIClient, conf *Conf
 
 	// Init callback: on delete session.
 	c.EntityCommon.delSessionCallback = func(ctx context.Context) error {
-		err := c.EntityCommon.updateClientEntry(ctx, c.done)
+		err := c.EntityCommon.updateClientEntry(ctx, c.done, c.conf.ClientType)
 		return err
 	}
 
@@ -151,6 +153,8 @@ func (ce *Client) Serve(ctx context.Context) {
 		}
 	}(cancellabelCtx)
 
+	updateEntryLoopOnce := new(sync.Once)
+
 	for {
 		if isClosed(ce.done) {
 			return
@@ -174,9 +178,18 @@ func (ce *Client) Serve(ctx context.Context) {
 					entries = entries[ind : ind+1]
 				}
 			}
+		} else if ctx.Value("setupNode") != nil {
+			entries, err = ce.discoverServers(cancellabelCtx, true)
+			if err != nil {
+				ce.log.WithError(err).Warn("Failed to discover dmsg servers.")
+				if err == context.Canceled || err == context.DeadlineExceeded {
+					return
+				}
+				ce.serveWait()
+				continue
+			}
 		} else {
 			entries, err = ce.discoverServers(cancellabelCtx, false)
-
 			if err != nil {
 				ce.log.WithError(err).Warn("Failed to discover dmsg servers.")
 				if err == context.Canceled || err == context.DeadlineExceeded {
@@ -190,11 +203,26 @@ func (ce *Client) Serve(ctx context.Context) {
 			ce.log.Warnf("No entries found. Retrying after %s...", ce.bo.String())
 			ce.serveWait()
 		}
-
+		// randomize dmsg servers list
+		rand.Shuffle(len(entries), func(i, j int) {
+			entries[i], entries[j] = entries[j], entries[i]
+		})
 		for n, entry := range entries {
 			if isClosed(ce.done) {
 				return
 			}
+
+			// Skip dmsg servers without user specific types: official, community, all
+			if ce.conf.ConnectedServersType == "official" {
+				if entry.Server.ServerType != "official" {
+					continue
+				}
+			} else if ce.conf.ConnectedServersType == "community" {
+				if entry.Server.ServerType != "community" {
+					continue
+				}
+			}
+
 			// If MinSessions is set to 0 then we connect to all available servers.
 			// If MinSessions is not 0 AND we have enough sessions, we wait for error or done signal.
 			if ce.conf.MinSessions != 0 && ce.SessionCount() >= ce.conf.MinSessions {
@@ -227,6 +255,10 @@ func (ce *Client) Serve(ctx context.Context) {
 				ce.serveWait()
 			}
 		}
+
+		// Only start the update entry loop once we have at least one session established.
+		updateEntryLoopOnce.Do(func() { go ce.updateClientEntryLoop(cancellabelCtx, ce.done, ce.conf.ClientType) })
+
 		// We dial all servers and wait for error or done signal.
 		select {
 		case <-ce.done:
@@ -334,6 +366,78 @@ func (ce *Client) DialStream(ctx context.Context, addr Addr) (*Stream, error) {
 	return nil, ErrCannotConnectToDelegated
 }
 
+// LookupIP dails to dmsg servers for public IP of the client.
+func (ce *Client) LookupIP(ctx context.Context, servers []cipher.PubKey) (myIP net.IP, err error) {
+
+	cancellabelCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	if servers == nil {
+		entries, err := ce.discoverServers(cancellabelCtx, true)
+		if err != nil {
+			return nil, err
+		}
+		for _, entry := range entries {
+			servers = append(servers, entry.Static)
+		}
+	}
+
+	// Range client's delegated servers.
+	// See if we are already connected to a delegated server.
+	for _, srvPK := range servers {
+		if dSes, ok := ce.clientSession(ce.porter, srvPK); ok {
+			ip, err := dSes.LookupIP(Addr{PK: dSes.RemotePK(), Port: 1})
+			if err != nil {
+				ce.log.WithError(err).WithField("server_pk", srvPK).Warn("Failed to dial server for IP.")
+				continue
+			}
+
+			// If the client is test client then ignore Public IP check
+			if ce.conf.ClientType == "test" {
+				return ip, nil
+			}
+
+			// Check if the IP is public
+			if !netutil.IsPublicIP(ip) {
+				return nil, errors.New("received non-public IP address from dmsg server")
+			}
+			return ip, nil
+		}
+	}
+
+	// Range client's delegated servers.
+	// Attempt to connect to a delegated server.
+	// And Close it after getting the IP.
+	for _, srvPK := range servers {
+		dSes, err := ce.EnsureAndObtainSession(ctx, srvPK)
+		if err != nil {
+			continue
+		}
+		ip, err := dSes.LookupIP(Addr{PK: dSes.RemotePK(), Port: 1})
+		if err != nil {
+			ce.log.WithError(err).WithField("server_pk", srvPK).Warn("Failed to dial server for IP.")
+			continue
+		}
+		err = dSes.Close()
+		if err != nil {
+			ce.log.WithError(err).WithField("server_pk", srvPK).Warn("Failed to close session")
+		}
+
+		// If the client is test client then ignore Public IP check
+		if ce.conf.ClientType == "test" {
+			return ip, nil
+		}
+
+		// Check if the IP is public
+		if !netutil.IsPublicIP(ip) {
+			return nil, errors.New("received non-public IP address from dmsg server")
+		}
+		return ip, nil
+	}
+
+	return nil, ErrCannotConnectToDelegated
+}
+
 // Session obtains an established session.
 func (ce *Client) Session(pk cipher.PubKey) (ClientSession, bool) {
 	return ce.clientSession(ce.porter, pk)
@@ -371,7 +475,6 @@ func (ce *Client) EnsureAndObtainSession(ctx context.Context, srvPK cipher.PubKe
 	if err != nil {
 		return ClientSession{}, err
 	}
-
 	return ce.dialSession(ctx, srvEntry)
 }
 
@@ -445,7 +548,7 @@ func (ce *Client) dialSession(ctx context.Context, entry *disc.Entry) (cs Client
 
 // AllStreams returns all the streams of the current client.
 func (ce *Client) AllStreams() (out []*Stream) {
-	fn := func(port uint16, pv netutil.PorterValue) (next bool) {
+	fn := func(port uint16, pv netutil.PorterValue) (next bool) { //nolint
 		if str, ok := pv.Value.(*Stream); ok {
 			out = append(out, str)
 			return true
@@ -470,6 +573,25 @@ func (ce *Client) AllEntries(ctx context.Context) (entries []string, err error) 
 		return err
 	})
 	return entries, err
+}
+
+// AllVisorEntries returns all the entries registered in discovery that are visor
+func (ce *Client) AllVisorEntries(ctx context.Context) (entries []string, err error) {
+	err = netutil.NewDefaultRetrier(ce.log).Do(ctx, func() error {
+		entries, err = ce.dc.AllEntries(ctx)
+		return err
+	})
+	return entries, err
+}
+
+// ConnectedServersPK return keys of all connected dmsg servers
+func (ce *Client) ConnectedServersPK() []string {
+	sessions := ce.allClientSessions(ce.porter)
+	addrs := make([]string, len(sessions))
+	for i, s := range sessions {
+		addrs[i] = s.RemotePK().String()
+	}
+	return addrs
 }
 
 // ConnectionsSummary associates connected clients, and the servers that connect such clients.
